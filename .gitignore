@@ -202,6 +202,15 @@ data/text2vec_models/
 
 song/
 
+# 网易云 BGM 运行时缓存（按需下载，不进版本库）
+bgm_cache/
+
+# 网易云登录 cookie（凭据，绝不进版本库）
+cookie/netease*
+
+# 点歌被限时切走后的续播临时片段
+out/song_resume/
+
 test.py
 
 # debug输出
@@ -254,3 +263,13 @@ static/
 add_dependencies.py
 
 spark-output/
+
+# 大肥鱼定制版：本地素材与运行态，不进版本库
+Live2D/live2d-model/大肥鱼/
+tools/DouyinBarrageGrab/
+out/songroom/
+out/song_lyric_ids.json
+song_disabled/
+promo-video/
+tutorial-video/
+*.bak

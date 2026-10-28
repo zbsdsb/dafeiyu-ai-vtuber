@@ -39,6 +39,9 @@ class MusicFacade:
     def fadeout(self, ms):
         self._stream.fadeout(ms)
 
+    def set_volume(self, value):
+        self._stream.set_volume(value)
+
 
 class PlaybackStream:
     """占用一个固定 channel 的播放流。
@@ -107,6 +110,12 @@ class PlaybackStream:
             self.stop()
             return
         sound.fadeout(ms)
+
+    def set_volume(self, value):
+        """只改本通道音量，0.0~1.0。未初始化时静默忽略。"""
+        if self._channel is None:
+            return
+        self._channel.set_volume(max(0.0, min(1.0, float(value))))
 
     def _load_sound(self):
         import pygame

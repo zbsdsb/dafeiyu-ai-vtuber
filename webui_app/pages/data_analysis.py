@@ -5,13 +5,17 @@ from utils.data_analysis import Data_Analysis
 from webui_app.pages import PageConfig
 
 
+def safe_opt(opt):
+    return opt if isinstance(opt, dict) else {}
+
+
 def build_data_analysis_tab(config, config_path, echart_css):
     data_analysis = Data_Analysis(config_path)
 
     data_analysis_comment_word_cloud_card = ui.card()
     with data_analysis_comment_word_cloud_card.style("width:100%;"):
-        echart_comment_word_cloud = ui.echart(data_analysis.get_comment_word_cloud_option(
-            int(config.get("data_analysis", "comment_word_cloud", "top_num")))
+        echart_comment_word_cloud = ui.echart(safe_opt(data_analysis.get_comment_word_cloud_option(
+            int(config.get("data_analysis", "comment_word_cloud", "top_num"))))
         ).style(echart_css)
 
         with ui.row():
@@ -19,8 +23,8 @@ def build_data_analysis_tab(config, config_path, echart_css):
 
             def update_echart_comment_word_cloud():
                 data_analysis_comment_word_cloud_card.remove(0)
-                echart = ui.echart(data_analysis.get_comment_word_cloud_option(
-                    int(input_data_analysis_comment_word_cloud_top_num.value))
+                echart = ui.echart(safe_opt(data_analysis.get_comment_word_cloud_option(
+                    int(input_data_analysis_comment_word_cloud_top_num.value)))
                 ).style(echart_css)
                 echart.move(data_analysis_comment_word_cloud_card, 0)
 
@@ -28,8 +32,8 @@ def build_data_analysis_tab(config, config_path, echart_css):
 
     data_analysis_integral_card = ui.card()
     with data_analysis_integral_card.style("width:100%;"):
-        echart_integral = ui.echart(data_analysis.get_integral_option(
-            "integral", int(config.get("data_analysis", "integral", "top_num")))
+        echart_integral = ui.echart(safe_opt(data_analysis.get_integral_option(
+            "integral", int(config.get("data_analysis", "integral", "top_num"))))
         ).style(echart_css)
 
         with ui.row():
@@ -37,9 +41,9 @@ def build_data_analysis_tab(config, config_path, echart_css):
 
             def update_echart_integral(type):
                 data_analysis_integral_card.remove(0)
-                echart = ui.echart(data_analysis.get_integral_option(
+                echart = ui.echart(safe_opt(data_analysis.get_integral_option(
                     type,
-                    int(input_data_analysis_integral_top_num.value))
+                    int(input_data_analysis_integral_top_num.value)))
                 ).style(echart_css)
                 echart.move(data_analysis_integral_card, 0)
 
@@ -50,15 +54,15 @@ def build_data_analysis_tab(config, config_path, echart_css):
 
     data_analysis_gift_card = ui.card()
     with data_analysis_gift_card.style("width:100%;"):
-        echart_gift = ui.echart(data_analysis.get_gift_option(int(config.get("data_analysis", "gift", "top_num")))).style(echart_css)
+        echart_gift = ui.echart(safe_opt(data_analysis.get_gift_option(int(config.get("data_analysis", "gift", "top_num"))))).style(echart_css)
 
         with ui.row():
             input_data_analysis_gift_top_num = ui.input(label='Top N个数据', value=config.get("data_analysis", "gift", "top_num"), placeholder='筛选Top N个数据')
 
             def update_echart_gift():
                 data_analysis_gift_card.remove(0)
-                echart = ui.echart(data_analysis.get_gift_option(
-                    int(input_data_analysis_gift_top_num.value))
+                echart = ui.echart(safe_opt(data_analysis.get_gift_option(
+                    int(input_data_analysis_gift_top_num.value)))
                 ).style(echart_css)
                 echart.move(data_analysis_gift_card, 0)
 

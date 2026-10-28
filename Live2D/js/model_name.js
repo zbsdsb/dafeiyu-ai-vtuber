@@ -1,1 +1,1 @@
-var model_name = "Hiyori";
+var model_name = "大肥鱼";

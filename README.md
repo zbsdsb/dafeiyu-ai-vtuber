@@ -1,3 +1,8 @@
+> **🐟 这是「大肥鱼」抖音 AI 虚拟主播定制版**，fork 自 [Ikaros-521/AI-Vtuber](https://github.com/Ikaros-521/AI-Vtuber)。
+> 加入了 Fish Audio 配音、横竖屏海底场景、台词字幕、跟着声音动的口型、网易云点歌与歌词、空闲背景乐、小心心祝福等功能。
+> 从零开始的安装和开播步骤见 **[docs/大肥鱼定制版使用说明.md](docs/大肥鱼定制版使用说明.md)**。仓库里不含 API Key、大肥鱼模型和弹幕监听程序，需要按说明自己准备。
+> 下面是上游的原版说明。
+
 <div align="center">
   <a href="https://ikaros-521.github.io/Luna-Docs/site/">
     <img src="https://raw.githubusercontent.com/Ikaros-521/AI-Vtuber/refs/heads/main/ui/icon.png" width="240" height="240" alt="点我跳转文档">

@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>大肥鱼 · 海底大厅 · 横屏</title>
+<link rel="stylesheet" href="./css/live2d.css">
+<script src="./js/model_name.js?v=20261027-mao"></script>
+<script src="./js/live2dcubismcore.js?v=5.1.0"></script>
+<script src="./js/bundle.songroom-lipsync.js?v=20261028-pose1"></script>
+<style>
+*{box-sizing:border-box}html,body{width:100%;height:100%;margin:0;overflow:hidden;background:#081b35}
+body{display:grid;place-items:center}
+#stage{position:absolute;width:1920px;height:1080px;overflow:hidden;isolation:isolate;transform-origin:center center;background:#102e51 url('./assets/aquarium-landscape-20261028.png') center/cover no-repeat}
+#model-surface{position:absolute;width:900px;height:1040px;left:510px;top:-5px;transform:scale(1);transform-origin:0 0;z-index:2}
+#landlord{width:900px!important;height:1040px!important;margin:0;background:transparent}
+#live2d{width:900px!important;height:1040px!important;display:block}
+.message,#controller{display:none!important}
+</style></head><body>
+<main id="stage" data-layout="clean-landscape" aria-label="海底大厅直播场景">
+<div id="model-surface"><div id="landlord"><canvas id="live2d" class="live2d" width="1800" height="2080" aria-label="AI Live2D 角色"></canvas></div></div>
+</main>
+<script src="./js/jquery.min.js"></script>
+<script src="./js/songroom-lipsync.js?v=20261028-lip1"></script>
+<script>
+// 舞台尺寸和 OBS 来源尺寸一致时为 1:1，不套另一层横竖画布。
+const stage=document.getElementById('stage');
+function fitStage(){stage.style.transform=`scale(${Math.min(innerWidth/1920,innerHeight/1080)})`;}
+addEventListener('resize',fitStage);fitStage();
+</script><script src="./js/stage-captions.js?v=caption1"></script>
+<script src="./js/stage-overlay.js?v=overlay1"></script>
+</body></html>

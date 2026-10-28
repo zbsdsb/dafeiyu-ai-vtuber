@@ -23,6 +23,13 @@ def build_visual_body_tab(config, common, card_css, switch_internal_css):
                 data_json = {}
                 for line in live2d_names:
                     data_json[line] = line
+                # 配置里的模型目录还没放进 Live2D/live2d-model 时（比如刚克隆、还没下载大肥鱼模型），
+                # NiceGUI 的 select 遇到不在选项里的值会直接抛 ValueError，整个后台起不来。
+                # 保留该值并标明缺失，不替用户改配置。
+                current_live2d_name = config.get("live2d", "name")
+                if current_live2d_name and current_live2d_name not in data_json:
+                    logger.warning(f"Live2D 模型目录不存在：Live2D/live2d-model/{current_live2d_name}，请先放入模型文件")
+                    data_json[current_live2d_name] = f"{current_live2d_name}（未找到模型文件）"
                 select_live2d_name = ui.select(
                     label='模型名',
                     options=data_json,

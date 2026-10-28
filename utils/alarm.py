@@ -6,6 +6,7 @@ import threading
 import time
 import traceback
 
+from . import notifier
 from .message import build
 from .my_log import logger
 
@@ -17,6 +18,16 @@ ERROR_COUNT_WINDOW = 600
 _state_lock = threading.Lock()
 
 CATEGORIES = ("platform", "llm", "tts", "svc", "visual_body", "other")
+
+# 推到手机时用的中文名，别让人收到一串英文 key
+CATEGORY_LABELS = {
+    "platform": "平台连接",
+    "llm": "大语言模型",
+    "tts": "语音合成",
+    "svc": "变声",
+    "visual_body": "虚拟形象",
+    "other": "其他",
+}
 
 
 def new_state():
@@ -49,12 +60,25 @@ def report_error(state, type, config, common, synthesize):
 
         logger.debug(f"abnormal_alarm_handle type={type}, error_count={error_count}")
 
+        label = CATEGORY_LABELS.get(type, type)
+        start_num = config.get("abnormal_alarm", type, "start_alarm_error_num")
+
+        # 手机通知独立于下面的音频播报：本地音频类型被改掉也照样能收到推送。
+        # 只在刚好跨过阈值那一次推，后面每次都推会把手机刷爆。
+        if start_num is not None and error_count == int(start_num):
+            notifier.send(config, f"【大肥鱼直播】{label}报警",
+                          f"10 分钟内已连续出错 {error_count} 次，直播间会播报提醒。",
+                          key=type)
+
         if config.get("abnormal_alarm", type, "type") != "local_audio":
             return True
 
         # 是否错误数大于 自动重启错误数
         if error_count >= config.get("abnormal_alarm", type, "auto_restart_error_num"):
             logger.warning(f"【异常报警-{type}】 出错数超过自动重启错误数，即将自动重启")
+            notifier.send(config, f"【大肥鱼直播】{label}自动重启",
+                          f"10 分钟内已连续出错 {error_count} 次，正在重启直播程序。",
+                          key=f"{type}-restart")
             data = {
                 "type": "restart",
                 "api_type": "api",

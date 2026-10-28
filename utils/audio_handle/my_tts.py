@@ -883,3 +883,51 @@ class MY_TTS:
             logger.error(f'Index-tts未知错误，请检查您的Index-tts API是否启动/配置是否正确，报错内容: {e}')
         
         return None
+
+    # 请求Fish Audio官方API
+    def fish_audio_api(self, data):
+        try:
+            import json, urllib.request
+            api_key = data.get("api_key") or os.environ.get("FISH_API_KEY", "")
+            if not api_key:
+                logger.error("未配置 Fish Audio API Key（请在 config.json 的 fish_audio.api_key 或环境变量 FISH_API_KEY 中设置）")
+                return None
+
+            reference_id = data.get("reference_id")
+            model = data.get("model", "s2.1-pro-free")
+            body = {
+                "text": data["content"],
+                "format": "mp3",
+                "mp3_bitrate": 192,
+                "latency": "normal",
+                "normalize": True,
+                "prosody": {"speed": float(data.get("speed", 1.0)), "volume": 0, "normalize_loudness": True}
+            }
+            if reference_id and reference_id.strip():
+                body["reference_id"] = reference_id.strip()
+
+            req = urllib.request.Request(
+                "https://api.fish.audio/v1/tts",
+                data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+                method="POST",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json; charset=utf-8",
+                    "model": model
+                }
+            )
+
+            file_name = 'fish_audio_' + self.common.get_bj_time(4) + '.mp3'
+            voice_tmp_path = self.common.get_new_audio_path(self.audio_out_path, file_name)
+
+            with urllib.request.urlopen(req, timeout=120) as r:
+                with open(voice_tmp_path, "wb") as f:
+                    f.write(r.read())
+
+            logger.info(f"Fish Audio 合成成功，保存至: {voice_tmp_path}")
+            return voice_tmp_path
+        except Exception as e:
+            logger.error(traceback.format_exc())
+            logger.error(f'Fish Audio 请求失败: {e}')
+            return None
+

@@ -21,6 +21,12 @@ class Chatgpt:
     current_key_index = 0
     data_openai = {}
     data_chatgpt = {}
+    # 这几个采样参数以前只写进 config.json、UI 上也能改，但请求里从来没带过，
+    # 调温度、调 max_tokens 都等于没动。现在统一从这里取。
+    SAMPLING_KEYS = ("temperature", "max_tokens", "top_p", "presence_penalty", "frequency_penalty")
+    # 上游明确不接受的参数。mercury 这类转接模型常常只支持一部分参数，
+    # 拒一次就记下来，本进程后续不再发送，避免每条弹幕都先失败一次。
+    unsupported_sampling = set()
 
     def __init__(self, data_openai, data_chatgpt):
         self.common = Common()
@@ -108,6 +114,38 @@ class Chatgpt:
             return Chatgpt.sessions[sessionid]
 
 
+    def get_sampling_params(self):
+        """取当前会话要发的采样参数；配置里没填或已被上游拒绝的项直接跳过。"""
+        params = {}
+        for key in self.SAMPLING_KEYS:
+            if key in Chatgpt.unsupported_sampling:
+                continue
+            value = self.data_chatgpt.get(key)
+            if value is None or value == "":
+                continue
+            params[key] = value
+        return params
+
+    def create_completion(self, client, stream=False, **kwargs):
+        """带采样参数发起请求，上游拒哪个就去掉哪个重试，不让一个参数把整条直播链路挂掉。"""
+        params = self.get_sampling_params()
+        while True:
+            request = dict(kwargs)
+            request.update(params)
+            if stream:
+                request["stream"] = True
+            try:
+                return client.chat.completions.create(**request)
+            except openai.BadRequestError as error:
+                # 报文里点名的参数才丢，避免把无关的 400 也吞成重试
+                dropped = [key for key in params if key in str(error)]
+                if not dropped:
+                    raise
+                for key in dropped:
+                    params.pop(key, None)
+                    Chatgpt.unsupported_sampling.add(key)
+                logger.warning(f"上游不接受参数 {dropped}，去掉后重试：{error}")
+
     def chat_with_gpt(self, messages):
         """
         使用 ChatGPT 接口生成回复消息
@@ -138,7 +176,8 @@ class Chatgpt:
                 resp = openai.ChatCompletion.create(
                     model=self.data_chatgpt['model'],
                     messages=messages,
-                    timeout=30
+                    timeout=30,
+                    **self.get_sampling_params()
                 )
 
                 resp = resp['choices'][0]['message']['content']
@@ -147,7 +186,8 @@ class Chatgpt:
 
                 client = openai.OpenAI(base_url=openai.api_base, api_key=openai.api_key)
                 # 调用 ChatGPT 接口生成回复消息
-                resp = client.chat.completions.create(
+                resp = self.create_completion(
+                    client,
                     model=self.data_chatgpt['model'],
                     messages=messages,
                     timeout=30
@@ -226,6 +266,7 @@ class Chatgpt:
                     messages=messages,
                     timeout=30,
                     stream=True,
+                    **self.get_sampling_params()
                 )
 
             else:
@@ -233,11 +274,12 @@ class Chatgpt:
 
                 client = openai.OpenAI(base_url=openai.api_base, api_key=openai.api_key)
                 # 调用 ChatGPT 接口生成回复消息
-                resp = client.chat.completions.create(
+                resp = self.create_completion(
+                    client,
+                    stream=True,
                     model=self.data_chatgpt['model'],
                     messages=messages,
-                    timeout=30,
-                    stream=True,
+                    timeout=30
                 )
 
             return resp

@@ -30,6 +30,7 @@ AUDIO_SYNTHESIS_TYPE_OPTIONS = {
     'vits': 'VITS',
     'bert_vits2': 'bert_vits2',
     'elevenlabs': 'elevenlabs',
+    'fish_audio': 'Fish Audio',
     'openai_tts': 'OpenAI TTS',
     'gradio_tts': 'Gradio',
     'gpt_sovits': 'GPT_SoVITS',

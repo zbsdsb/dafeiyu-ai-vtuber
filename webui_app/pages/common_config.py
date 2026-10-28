@@ -712,9 +712,9 @@ def build_common_config_tab(config, common, card_css, switch_internal_css, butto
                     
                     select_search_online_engine = ui.select(
                         label='搜索引擎',
-                        options={'baidu': '百度搜索', 'google': '谷歌搜索'},
+                        options={'baidu': '百度搜索', 'google': '谷歌搜索', 'bing': '必应搜索'},
                         value=config.get("search_online", "engine")
-                    ).style("width:100px;").tooltip('使用的搜索引擎')
+                    ).style("width:100px;").tooltip('使用的搜索引擎；实测 2026-10 只有必应还能解析出结果')
                     input_search_online_engine_id = ui.input(label='引擎ID', value=config.get("search_online", "engine_id"), placeholder='默认：1，不建议修改').style("width:100px;").tooltip('就是单个引擎可能会有多种搜索方式，目前仅谷歌有2种，默认不建议修改')
                     input_search_online_count = ui.input(label='检索的文章数', value=config.get("search_online", "count"), placeholder='默认为：1，但有时候可能文章内容解析出来是空的，可以适当扩大检索数').style("width:100px;").tooltip('默认为：1，但有时候可能文章内容解析出来是空的，可以适当扩大检索数')
                     input_search_online_resp_template = ui.input(label='结果模板', value=config.get("search_online", "resp_template"), placeholder='检索后数据会以这个模板格式生成问题，请不要删除{}的两个变量，会导致无法运行').style("width:500px;").tooltip('检索后数据会以这个模板格式生成问题，请不要删除{}的两个变量，会导致无法运行')
@@ -1120,6 +1120,32 @@ def build_common_config_tab(config, common, card_css, switch_internal_css, butto
                     input_abnormal_alarm_other_start_alarm_error_num = ui.input(label='开始报警错误数', value=config.get("abnormal_alarm", "other", "start_alarm_error_num"), placeholder='开始异常报警的错误数，超过这个数后就会报警').style("width:100px;")
                     input_abnormal_alarm_other_auto_restart_error_num = ui.input(label='自动重启错误数', value=config.get("abnormal_alarm", "other", "auto_restart_error_num"), placeholder='记得先启用“自动运行”功能。自动重启的错误数，超过这个数后就会自动重启webui。').style("width:100px;")
                     input_abnormal_alarm_other_local_audio_path = ui.input(label='本地音频路径', value=config.get("abnormal_alarm", "other", "local_audio_path"), placeholder='本地音频存储的文件路径（可以是多个音频，随机一个）').style("width:300px;")
+                # 本地音频只能让直播间的观众听到；开播时人不在电脑前，还需要推到手机上
+                # 通道各自独立开关，配了哪路发哪路（参考 douyin-fire-web 的钉钉+Telegram 双发做法）
+                with ui.row():
+                    switch_notify_enable = ui.switch('启用手机通知', value=config.get("notify", "enable")).style(switch_internal_css).tooltip('到达报警阈值、以及自动重启时各推一条；下面配了哪路就发哪路')
+                    input_notify_repeat_interval_seconds = ui.input(label='同类通知最小间隔（秒）', value=config.get("notify", "repeat_interval_seconds"), placeholder='同一类在这段时间内只推一次').style("width:150px;")
+                with ui.expansion('通知通道（可同时启用多路）', icon="notifications_active", value=False).classes('w-full'):
+                    with ui.row():
+                        switch_notify_dingtalk_enable = ui.switch('钉钉', value=config.get("notify", "dingtalk", "enable")).style(switch_internal_css).tooltip('markdown 消息，必须配加签 secret')
+                        input_notify_dingtalk_webhook = ui.input(label='钉钉 webhook', value=config.get("notify", "dingtalk", "webhook"), placeholder='https://oapi.dingtalk.com/robot/send?access_token=...').style("width:380px;")
+                        input_notify_dingtalk_secret = ui.input(label='钉钉加签 secret', value=config.get("notify", "dingtalk", "secret"), placeholder='群机器人安全设置选「加签」，SEC 开头的字符串').style("width:300px;")
+                    with ui.row():
+                        switch_notify_telegram_enable = ui.switch('Telegram', value=config.get("notify", "telegram", "enable")).style(switch_internal_css)
+                        input_notify_telegram_bot_token = ui.input(label='bot token', value=config.get("notify", "telegram", "bot_token"), placeholder='123456:ABC-DEF...').style("width:300px;")
+                        input_notify_telegram_chat_id = ui.input(label='chat id', value=config.get("notify", "telegram", "chat_id"), placeholder='个人或群的 chat id').style("width:200px;")
+                        input_notify_telegram_proxy = ui.input(label='代理', value=config.get("notify", "telegram", "proxy"), placeholder='留空则依次试 7890/7897/1080/直连').style("width:250px;")
+                    with ui.row():
+                        switch_notify_wecom_enable = ui.switch('企业微信', value=config.get("notify", "wecom", "enable")).style(switch_internal_css)
+                        input_notify_wecom_webhook = ui.input(label='群机器人 webhook', value=config.get("notify", "wecom", "webhook"), placeholder='https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=...').style("width:440px;")
+                    with ui.row():
+                        switch_notify_feishu_enable = ui.switch('飞书', value=config.get("notify", "feishu", "enable")).style(switch_internal_css)
+                        input_notify_feishu_webhook = ui.input(label='群机器人 webhook', value=config.get("notify", "feishu", "webhook"), placeholder='https://open.feishu.cn/open-apis/bot/v2/hook/...').style("width:400px;")
+                    with ui.row():
+                        switch_notify_bark_enable = ui.switch('Bark', value=config.get("notify", "bark", "enable")).style(switch_internal_css)
+                        input_notify_bark_url = ui.input(label='Bark 推送地址', value=config.get("notify", "bark", "url"), placeholder='https://api.day.app/你的key').style("width:400px;")
+                        switch_notify_serverchan_enable = ui.switch('Server酱', value=config.get("notify", "serverchan", "enable")).style(switch_internal_css)
+                        input_notify_serverchan_sendkey = ui.input(label='SendKey', value=config.get("notify", "serverchan", "sendkey"), placeholder='SCT 开头的 SendKey').style("width:260px;")
                 
         if config.get("webui", "show_card", "common_config", "coordination_program"):
             with ui.expansion('联动程序', icon="settings", value=True).classes('w-full'):
@@ -1484,6 +1510,37 @@ def build_common_config_tab(config, common, card_css, switch_internal_css, butto
                     "start_alarm_error_num": (input_abnormal_alarm_other_start_alarm_error_num, 'int'),
                     "auto_restart_error_num": (input_abnormal_alarm_other_auto_restart_error_num, 'int'),
                     "local_audio_path": (input_abnormal_alarm_other_local_audio_path, 'str'),
+                },
+            }
+            config_mapping["notify"] = {
+                "enable": (switch_notify_enable, 'bool'),
+                "repeat_interval_seconds": (input_notify_repeat_interval_seconds, 'int'),
+                "dingtalk": {
+                    "enable": (switch_notify_dingtalk_enable, 'bool'),
+                    "webhook": (input_notify_dingtalk_webhook, 'str'),
+                    "secret": (input_notify_dingtalk_secret, 'str'),
+                },
+                "telegram": {
+                    "enable": (switch_notify_telegram_enable, 'bool'),
+                    "bot_token": (input_notify_telegram_bot_token, 'str'),
+                    "chat_id": (input_notify_telegram_chat_id, 'str'),
+                    "proxy": (input_notify_telegram_proxy, 'str'),
+                },
+                "wecom": {
+                    "enable": (switch_notify_wecom_enable, 'bool'),
+                    "webhook": (input_notify_wecom_webhook, 'str'),
+                },
+                "feishu": {
+                    "enable": (switch_notify_feishu_enable, 'bool'),
+                    "webhook": (input_notify_feishu_webhook, 'str'),
+                },
+                "bark": {
+                    "enable": (switch_notify_bark_enable, 'bool'),
+                    "url": (input_notify_bark_url, 'str'),
+                },
+                "serverchan": {
+                    "enable": (switch_notify_serverchan_enable, 'bool'),
+                    "sendkey": (input_notify_serverchan_sendkey, 'str'),
                 },
             }
 

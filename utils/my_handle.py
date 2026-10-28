@@ -7,6 +7,9 @@ import asyncio
 
 import copy
 import re
+import time
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 
 
@@ -90,6 +93,12 @@ class My_handle(metaclass=SingletonMeta):
     thanks_entrance_copy = []
     thanks_gift_copy = []
     thanks_follow_copy = []
+
+    # 入场欢迎语（LLM 实时生成）：最近说过的几句（给模型避重）、近一分钟的调用时间（限流）、生成用的线程池
+    entrance_recent = deque(maxlen=6)
+    entrance_llm_times = deque()
+    entrance_llm_lock = threading.Lock()
+    entrance_llm_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="entrance-llm")
 
     def __init__(self, config_path):
         logger.info("初始化My_handle...")
@@ -1044,13 +1053,30 @@ class My_handle(metaclass=SingletonMeta):
                 # 判断是否有此歌曲
                 song_filename = My_handle.common.find_best_match(content, choose_song_song_lists, similarity=My_handle.config.get("choose_song", "similarity"))
                 if song_filename is None:
-                    # resp_content = f"抱歉，我还没学会唱{content}"
-                    # 根据配置的 匹配失败回复文案来进行合成
+                    # 本地未命中，尝试从网易云音乐在线搜索并下载
+                    try:
+                        from utils.netease_music import search_and_download_netease_music
+                        logger.info(f"本地曲库未命中《{content}》，正在从网易云音乐在线检索...")
+                        downloaded_path, song_info = search_and_download_netease_music(content, My_handle.config.get("choose_song", "song_path"))
+                        if downloaded_path:
+                            resp_content = downloaded_path
+                            logger.info(f"网易云点歌成功！匹配到的音频路径：{resp_content}")
+                            play_tip = f"好的，正在为你播放网易云音乐《{song_info}》"
+                            tip_message = build_message(My_handle.config, "comment", username, play_tip)
+                            self.audio_synthesis_handle(tip_message)
+
+                            message = build_message(My_handle.config, "song", username, resp_content)
+                            self.webui_show_chat_log_callback("点歌", data, f"网易云音乐: {song_info}")
+                            self.audio_synthesis_handle(message)
+                            return True
+                    except Exception as e:
+                        logger.error(f"网易云在线检索异常: {e}")
+
+                    # 网易云也未匹配到，根据配置的匹配失败回复文案来进行合成
                     resp_content = My_handle.config.get("choose_song", "match_fail_copy").format(content=content)
                     logger.info(f"[AI回复{username}]：{resp_content}")
 
                     message = build_message(My_handle.config, "comment", username, resp_content)
-
                     
                     self.audio_synthesis_handle(message)
 
@@ -1078,7 +1104,12 @@ class My_handle(metaclass=SingletonMeta):
                 return True
             # 判断取消点歌命令是否正确
             elif stop_cmd:
+                # 只 fadeout 当前音频的话，后面排队的歌曲/回复会接着播，
+                # 主播喊「别唱了」却继续响，等于命令没生效。这里连队列一起清。
                 My_handle.audio.stop_current_audio()
+                My_handle.audio.clear_queue("voice_tmp_path_queue")
+                My_handle.audio.clear_queue("message_queue")
+                logger.info(f"[{username}]: {content} -> 已停止当前播放并清空待播/待合成队列")
 
                 return True
             
@@ -1574,17 +1605,24 @@ class My_handle(metaclass=SingletonMeta):
             # 使用字典映射的方式来获取响应内容
             resp = chat_model_methods.get(chat_type, lambda: data["content"])()
             
+            # 短句合并阈值：逗号/顿号/分号切出来的碎片太短就不再切，攒够再切。
+            # 每切一段就要单独调一次 Fish Audio（2~4 秒），切得越碎合成越追不上播放，
+            # 段与段之间就会空 2~4 秒，听起来一顿一顿的。
+            MIN_SPLIT_CHARS = 14
+
             def split_by_chinese_punctuation(s):
-                # 定义中文标点符号集合
-                chinese_punctuation = "。、，；！？"
-                
-                # 遍历字符串中的每一个字符
+                # 句末标点：本身就是自然停顿，多短都可以切
+                enders = "。！？"
+                # 句中标点：只有这一句已经够长了才切，避免「日子嘛，」「聊聊天。」这种碎片
+                separators = "、，；"
+
                 for i, char in enumerate(s):
-                    if char in chinese_punctuation:
-                        # 找到第一个中文标点符号，进行切分
+                    if char in enders:
                         return {"ret": True, "content1": s[:i+1], "content2": s[i+1:].lstrip()}
-                
-                # 如果没有找到中文标点符号，返回原字符串和空字符串
+                    if char in separators and (i + 1) >= MIN_SPLIT_CHARS:
+                        return {"ret": True, "content1": s[:i+1], "content2": s[i+1:].lstrip()}
+
+                # 没到可切的标点，继续攒
                 return {"ret": False, "content1": s, "content2": ""}
 
             if resp is not None:
@@ -1622,6 +1660,24 @@ class My_handle(metaclass=SingletonMeta):
                 }
 
                 buffer = b""
+
+                def flush_stream_tail(tmp, cut_len):
+                    """流结束时把剩余文本全部合成掉。
+
+                    原实现只在「剩余文本没有标点」时才补发：剩下半句带逗号的会被直接丢掉，
+                    于是观众听到的语音总是缺最后一句。
+                    """
+                    for _ in range(50):
+                        part = split_by_chinese_punctuation(tmp)
+                        if not part["ret"]:
+                            if tmp.strip():
+                                tmp, cut_len = tmp_handle({"ret": True, "content1": tmp, "content2": ""}, tmp, cut_len)
+                            break
+                        before = tmp
+                        tmp, cut_len = tmp_handle(part, tmp, cut_len)
+                        if tmp == before:
+                            break
+                    return tmp, cut_len
 
                 def tmp_handle(resp_json: dict, tmp: str, cut_len: int=0):
                     if resp_json["ret"]:
@@ -1821,24 +1877,19 @@ class My_handle(metaclass=SingletonMeta):
                                 data_dict = json.loads(decoded_line[5:])
                                 status = data_dict.get("status")
                                 if len(status) > 0 and status == "finish":
-                                    resp_json['ret'] = True
-                                    tmp, cut_len = tmp_handle(resp_json, tmp, cut_len)
+                                    tmp, cut_len = flush_stream_tail(tmp, cut_len)
 
                                     logger.info(f"[{chat_type}] 流式接收完毕")
                                     break
                         else:
                             if chunk.choices[0].finish_reason == "stop":
-                                if not resp_json['ret']:
-                                    resp_json['ret'] = True
-                                    tmp, cut_len = tmp_handle(resp_json, tmp, cut_len)
+                                tmp, cut_len = flush_stream_tail(tmp, cut_len)
 
                                 logger.info(f"[{chat_type}] 流式接收完毕")
                                 break
                     elif chat_type in ["tongyi"]:
                         if chunk.output.choices[0].finish_reason == "stop":
-                            if not resp_json['ret']:
-                                resp_json['ret'] = True
-                                tmp, cut_len = tmp_handle(resp_json, tmp, cut_len)
+                            tmp, cut_len = flush_stream_tail(tmp, cut_len)
 
                             logger.info(f"[{chat_type}] 流式接收完毕")
                             break
@@ -2301,6 +2352,9 @@ class My_handle(metaclass=SingletonMeta):
         Returns:
             bool: 是否正常触发了按键映射事件，是True 否False
         """
+        if not My_handle.config.get("key_mapping", "enable"):
+            return False
+
         flag = False
 
         # 获取一个文案并传递给音频合成函数进行音频合成
@@ -2707,6 +2761,42 @@ class My_handle(metaclass=SingletonMeta):
                 My_handle.live_data[type].append(data)
         return False
 
+    # 舞台信号：思考气泡 / 一次性特效（走 5500 字幕服务，失败不影响主链路）
+    def set_thinking(self, on: bool):
+        """通知舞台层角色进入/退出「思考中」。服务端 25 秒自动失效，不会永久挂着。"""
+        try:
+            url = My_handle.config.get("web_captions_printer", "api_ip_port")
+            if not url:
+                return
+            My_handle.common.notify_stage(url, "/thinking", {"on": 1 if on else 0})
+        except Exception:
+            logger.debug(traceback.format_exc())
+
+    def stage_effect_handle(self, content: str):
+        """弹幕命中特效关键词时让画面放一次特效。
+
+        配置：effects.<名字>.enable / effects.<名字>.keywords
+        现阶段只有 clap（鼓掌）。不模拟按键，所以不会打到其他窗口。
+        """
+        try:
+            effects = My_handle.config.get("effects")
+            if not isinstance(effects, dict):
+                return False
+            url = My_handle.config.get("web_captions_printer", "api_ip_port")
+            if not url:
+                return False
+            for name, item in effects.items():
+                if not isinstance(item, dict) or not item.get("enable"):
+                    continue
+                if any(word and word in content for word in item.get("keywords", [])):
+                    My_handle.common.notify_stage(url, "/effect", {"name": name})
+                    logger.info(f"[舞台特效] {name} 已触发：{content}")
+                    return True
+            return False
+        except Exception:
+            logger.debug(traceback.format_exc())
+            return False
+
     # 判断是否进行联网搜索，返回处理后的结果
     def search_online_handle(self, content: str):
         try:
@@ -2939,7 +3029,11 @@ class My_handle(metaclass=SingletonMeta):
             # 3、画图模式 触发后不执行后面的其他功能
             if self.sd_handle(data):
                 return
-            
+
+            # 3.5 舞台特效：弹幕命中关键词就让画面放一次特效（鼓掌等）。
+            # 走内网 HTTP 信号直达浏览器源，不用模拟按键，不会误触到其他窗口。
+            self.stage_effect_handle(content)
+
             # 4、弹幕内容是否进行翻译
             if My_handle.config.get("translate", "enable") and (My_handle.config.get("translate", "trans_type") == "弹幕" or \
                 My_handle.config.get("translate", "trans_type") == "弹幕+回复"):
@@ -2985,10 +3079,18 @@ class My_handle(metaclass=SingletonMeta):
                 # 当前选用的LLM类型是否支持stream，并且启用stream
                 if "stream" in self.config.get(chat_type) and self.config.get(chat_type, "stream"):
                     logger.warning("使用流式推理LLM")
-                    resp_content = self.llm_stream_handle_and_audio_synthesis(chat_type, data_json)
+                    self.set_thinking(True)
+                    try:
+                        resp_content = self.llm_stream_handle_and_audio_synthesis(chat_type, data_json)
+                    finally:
+                        self.set_thinking(False)
                     return resp_content
                 else:
-                    resp_content = self.llm_handle(chat_type, data_json)
+                    self.set_thinking(True)
+                    try:
+                        resp_content = self.llm_handle(chat_type, data_json)
+                    finally:
+                        self.set_thinking(False)
                     if resp_content is not None:
                         logger.info(f"[AI回复{username}]：{resp_content}")
                     else:
@@ -3118,6 +3220,18 @@ class My_handle(metaclass=SingletonMeta):
             if not My_handle.config.get("thanks")["gift_enable"]:
                 return None
 
+            # 祝福是独立礼物互动，不依赖价格估算；同用户连击只播一次。
+            from .gift_actions import GiftBlessings
+            if not hasattr(self, "_gift_blessings"):
+                self._gift_blessings = GiftBlessings()
+            handled, blessing = self._gift_blessings.resolve(data, My_handle.config.get("gift_actions"))
+            if handled:
+                if blessing is None:
+                    return None
+                message = build_message(My_handle.config, "gift", data["username"], blessing, gift_info=data)
+                self.audio_synthesis_handle(message)
+                return message
+
             # 如果礼物总价低于设置的礼物感谢最低值
             if data["total_price"] < My_handle.config.get("thanks")["lowest_price"]:
                 return None
@@ -3222,24 +3336,102 @@ class My_handle(metaclass=SingletonMeta):
             # 括号语法替换
             resp_content = My_handle.common.brackets_text_randomize(resp_content)
 
-            message = build_message(My_handle.config, "entrance", data["username"], resp_content)
+            # 实时生成：上面抽到的模板句留作兜底。生成要几秒，不能堵住弹幕批处理线程，交给后台线程
+            llm_cfg = My_handle.config.get("thanks", "entrance_llm") or {}
+            if self._entrance_llm_wanted(llm_cfg):
+                threading.Thread(
+                    target=self._entrance_llm_worker,
+                    args=(data["username"], resp_content, llm_cfg),
+                    daemon=True, name="entrance-welcome",
+                ).start()
+                return None
 
-            # 洛曦 直播弹幕助手
-            if My_handle.config.get("luoxi_project", "Live_Comment_Assistant", "enable") and \
-                "entrance_reply" in My_handle.config.get("luoxi_project", "Live_Comment_Assistant", "type") and \
-                "消息产生时" in My_handle.config.get("luoxi_project", "Live_Comment_Assistant", "trigger_position"):
-                asyncio.run(send_msg_to_live_comment_assistant(My_handle.config.get("luoxi_project", "Live_Comment_Assistant"), resp_content))
-            
-            # 是否启用了周期性触发功能，启用此功能后，数据会被缓存，之后周期到了才会触发
-            if My_handle.config.get("thanks", "entrance", "periodic_trigger", "enable"):
-                My_handle.task_data["thanks"]["entrance"]["data"].append(message)
-            else:
-                self.audio_synthesis_handle(message)
-
-            return message
+            return self._deliver_entrance(data["username"], resp_content)
         except Exception as e:
             logger.error(traceback.format_exc())
             return None
+
+    def _deliver_entrance(self, username, resp_content):
+        """把欢迎语排进播报队列（模板路径和 LLM 路径共用）。"""
+        message = build_message(My_handle.config, "entrance", username, resp_content)
+
+        # 洛曦 直播弹幕助手
+        if My_handle.config.get("luoxi_project", "Live_Comment_Assistant", "enable") and \
+            "entrance_reply" in My_handle.config.get("luoxi_project", "Live_Comment_Assistant", "type") and \
+            "消息产生时" in My_handle.config.get("luoxi_project", "Live_Comment_Assistant", "trigger_position"):
+            asyncio.run(send_msg_to_live_comment_assistant(My_handle.config.get("luoxi_project", "Live_Comment_Assistant"), resp_content))
+
+        # 是否启用了周期性触发功能，启用此功能后，数据会被缓存，之后周期到了才会触发
+        if My_handle.config.get("thanks", "entrance", "periodic_trigger", "enable"):
+            My_handle.task_data["thanks"]["entrance"]["data"].append(message)
+        else:
+            self.audio_synthesis_handle(message)
+
+        return message
+
+    def _entrance_llm_wanted(self, llm_cfg):
+        """这一条欢迎语是否用 LLM 生成。任何条件不满足都走模板，行为和以前完全一样。"""
+        if not llm_cfg.get("enable"):
+            return False
+        if My_handle.config.get("chat_type") != "chatgpt":
+            return False
+        # 周期性触发会把消息攒起来延后播，异步生成的结果塞不进去
+        if My_handle.config.get("thanks", "entrance", "periodic_trigger", "enable"):
+            return False
+
+        # 限流：观众涌入时不能每人一次 LLM 调用
+        limit = int(llm_cfg.get("max_per_minute") or 8)
+        now = time.monotonic()
+        with My_handle.entrance_llm_lock:
+            while My_handle.entrance_llm_times and now - My_handle.entrance_llm_times[0] > 60:
+                My_handle.entrance_llm_times.popleft()
+            if len(My_handle.entrance_llm_times) >= limit:
+                return False
+            My_handle.entrance_llm_times.append(now)
+        return True
+
+    def _generate_entrance_welcome(self, username, llm_cfg):
+        """调 LLM 生成一句欢迎语；不像欢迎语返回 None。
+
+        直接调 chat_with_gpt，不走 get_gpt_resp：后者按昵称维护会话历史，会把这条欢迎语
+        当成观众说过的话留进他之后的聊天上下文。
+        """
+        from utils.entrance_welcome import DEFAULT_STYLES, build_messages, clean_reply, day_period
+
+        if getattr(self, "chatgpt", None) is None:
+            self.get_chat_model("chatgpt", My_handle.config)
+        max_chars = int(llm_cfg.get("max_chars") or 28)
+        styles = llm_cfg.get("styles") or DEFAULT_STYLES
+        messages = build_messages(
+            My_handle.config.get("chatgpt", "preset"), username, random.choice(styles),
+            day_period() if random.random() < 0.3 else None, list(My_handle.entrance_recent), max_chars,
+        )
+        return clean_reply(self.chatgpt.chat_with_gpt(messages), max_chars, username)
+
+    def _entrance_llm_worker(self, username, fallback, llm_cfg):
+        """后台线程：生成欢迎语，超时/失败/不像欢迎语就用模板句兜底，保证每个观众都能被欢迎到。"""
+        text = None
+        future = None
+        try:
+            future = My_handle.entrance_llm_pool.submit(self._generate_entrance_welcome, username, llm_cfg)
+            text = future.result(timeout=float(llm_cfg.get("timeout_seconds") or 6))
+        except Exception as e:
+            if future is not None:
+                future.cancel()
+            logger.warning(f"[入场欢迎] LLM 生成失败或超时，改用模板：{type(e).__name__}")
+
+        if text:
+            text = self.prohibitions_handle(text)
+        if text:
+            My_handle.entrance_recent.append(text)
+            logger.info(f"[入场欢迎] LLM 生成：{text}")
+        else:
+            logger.info("[入场欢迎] 用模板句")
+
+        try:
+            self._deliver_entrance(username, text or fallback)
+        except Exception:
+            logger.error(traceback.format_exc())
 
 
     # 关注处理
@@ -3759,10 +3951,18 @@ class My_handle(metaclass=SingletonMeta):
                 # 当前选用的LLM类型是否支持stream，并且启用stream
                 if "stream" in self.config.get(chat_type) and self.config.get(chat_type, "stream"):
                     logger.warning("使用流式推理LLM")
-                    resp_content = self.llm_stream_handle_and_audio_synthesis(chat_type, data_json)
+                    self.set_thinking(True)
+                    try:
+                        resp_content = self.llm_stream_handle_and_audio_synthesis(chat_type, data_json)
+                    finally:
+                        self.set_thinking(False)
                     return resp_content
                 else:
-                    resp_content = self.llm_handle(chat_type, data_json)
+                    self.set_thinking(True)
+                    try:
+                        resp_content = self.llm_handle(chat_type, data_json)
+                    finally:
+                        self.set_thinking(False)
                     if resp_content is not None:
                         logger.info(f"[AI回复{username}]：{resp_content}")
                     else:

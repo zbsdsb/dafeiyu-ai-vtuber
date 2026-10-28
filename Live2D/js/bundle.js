@@ -1896,7 +1896,7 @@
                 var e = !1;
                 if (this._model.loadParameters(), this._motionManager.isFinished() ? this.startRandomMotion(V.MotionGroupIdle, V.PriorityIdle) : e = this._motionManager.updateMotion(this._model, t), this._model.saveParameters(), e || null != this._eyeBlink && this._eyeBlink.updateParameters(this._model, t), null != this._expressionManager && this._expressionManager.updateMotion(this._model, t), this._model.addParameterValueById(this._idParamAngleX, 30 * this._dragX), this._model.addParameterValueById(this._idParamAngleY, 30 * this._dragY), this._model.addParameterValueById(this._idParamAngleZ, this._dragX * this._dragY * -30), this._model.addParameterValueById(this._idParamBodyAngleX, 10 * this._dragX), this._model.addParameterValueById(this._idParamEyeBallX, this._dragX), this._model.addParameterValueById(this._idParamEyeBallY, this._dragY), null != this._breath && this._breath.updateParameters(this._model, t), null != this._physics && this._physics.evaluate(this._model, t), this._lipsync)
                     for (var i = 0; i < this._lipSyncIds.getSize(); ++i) this._model.addParameterValueById(this._lipSyncIds.at(i), 0, .8);
-                null != this._pose && this._pose.updateParameters(this._model, t), this._model.update()
+                null != this._pose && this._pose.updateParameters(this._model, t), "大肥鱼" === window.model_name && (this._watermarkExpressionApplied || (this._watermarkExpressionApplied = !0, this.setExpression("13 水印消除")), this._model.setParameterValueById("Paramcol_3", 1)), this._model.update()
             }
         }, e.prototype.startMotion = function (t, e, i, r) {
             var o = this;

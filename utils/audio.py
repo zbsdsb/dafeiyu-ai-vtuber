@@ -5,6 +5,7 @@ from copy import deepcopy
 import aiohttp
 import os, random
 import copy
+import time
 import traceback
 
 from pydub import AudioSegment
@@ -17,6 +18,7 @@ from . import alarm
 from utils.audio_handle.my_tts import MY_TTS
 from utils.audio_handle.audio_player import AUDIO_PLAYER
 from utils.audio_handle.playback_stream import PlaybackStream
+from utils.audio_handle.bgm_player import BGMPlayer
 import utils.my_global as my_global
 
 
@@ -27,6 +29,9 @@ class Audio:
     # pygame.mixer实例
     mixer_normal = None
     mixer_copywriting = None
+
+    # 空闲 BGM（网易云）
+    bgm = None
 
     # 全局变量用于保存恢复文案播放计时器对象
     unpause_copywriting_play_timer = None
@@ -46,6 +51,16 @@ class Audio:
 
     # 第一次触发voice_tmp_path_queue_not_empty标志
     voice_tmp_path_queue_not_empty_flag = False
+
+    # 预缓冲阈值没凑够时的兜底定时器：阈值大于 1 时，单段回复不能永远等下去
+    voice_tmp_path_queue_prebuffer_timer = None
+
+    # 点歌被切走后的续播代数：清空队列（取消点歌、打断）时 +1，
+    # 后台还没切好的续播段看到代数变了就放弃，避免取消之后又冒出半首歌
+    song_resume_epoch = 0
+
+    # 点歌歌词（内存缓存，不落盘）：歌名 -> [(秒, 文字)]，只缓存匹配成功的
+    song_lyrics_cache = {}
 
     # 异常报警数据
     abnormal_alarm_data = alarm.new_state()
@@ -70,6 +85,18 @@ class Audio:
             # 弹幕回复一起暂停。
             Audio.mixer_normal = PlaybackStream(0)
             Audio.mixer_copywriting = PlaybackStream(1)
+
+            # 空闲 BGM：说话/点歌在播时自动暂停，播完再续上。
+            # 只看「已经有音频在响或已排上队」，不看待合成队列：等 Fish 合成要 2~4 秒，
+            # 那段时间该让 BGM 继续响着，不然就成了另一次冷场。
+            # 也要看队列而不只是 get_busy()：一段回复被拆成多句，句与句之间有几十
+            # 毫秒空档，只靠 get_busy() 会让 BGM 在句子中间抽插。
+            Audio.bgm = BGMPlayer(
+                self.config,
+                lambda: Audio.mixer_normal.get_busy()
+                or bool(Audio.voice_tmp_path_queue),
+            )
+            Audio.bgm.start()
 
         # 旧版同步写法
         # threading.Thread(target=self.message_queue_thread).start()
@@ -101,6 +128,7 @@ class Audio:
             bool: 清空结果
         """
         try:
+            Audio.song_resume_epoch += 1
             if type == "voice_tmp_path_queue":
                 if len(Audio.voice_tmp_path_queue) == 0:
                     return True
@@ -623,8 +651,37 @@ class Audio:
                 elif Audio.voice_tmp_path_queue_not_empty_flag:
                     # 生产者通过notify()通知消费者列表中有新的消息
                     Audio.voice_tmp_path_queue_not_empty.notify()
+                else:
+                    # 还在攒预缓冲。单段回复（短句、闲时任务）不会再有第二段，
+                    # 没有兜底就会永远卡在队列里不播。
+                    self._schedule_first_play_timeout()
 
             return {"code": 200, "msg": f"音频已插入到位置 {insert_position}"}
+
+    def _schedule_first_play_timeout(self):
+        """预缓冲没凑够阈值时，到点先播已合成的。
+
+        调用方已持有 voice_tmp_path_queue_lock；这里只起一个定时器，回调用时再取锁。
+        """
+        if Audio.voice_tmp_path_queue_prebuffer_timer is not None:
+            return
+
+        timeout = float(self.config.get("filter", "voice_tmp_path_queue_start_timeout") or 1.0)
+
+        def release():
+            with Audio.voice_tmp_path_queue_lock:
+                Audio.voice_tmp_path_queue_prebuffer_timer = None
+                if Audio.voice_tmp_path_queue_not_empty_flag:
+                    return
+                if Audio.voice_tmp_path_queue:
+                    logger.info("[音频队列] 预缓冲未凑够阈值，超时先播已合成的音频")
+                    Audio.voice_tmp_path_queue_not_empty_flag = True
+                    Audio.voice_tmp_path_queue_not_empty.notify()
+
+        timer = threading.Timer(max(0.2, timeout), release)
+        timer.daemon = True
+        Audio.voice_tmp_path_queue_prebuffer_timer = timer
+        timer.start()
 
     # 音频合成（edge-tts / vits_fast等）并播放
     def audio_synthesis(self, message):
@@ -926,6 +983,18 @@ class Audio:
 
                 # 调用接口合成语音
                 voice_tmp_path = self.my_tts.openai_tts_api(data)
+            
+            elif message["tts_type"] == "fish_audio":
+                data = {
+                    "api_key": message.get("data", {}).get("api_key", ""),
+                    "reference_id": message.get("data", {}).get("reference_id", ""),
+                    "model": message.get("data", {}).get("model", "s2.1-pro-free"),
+                    "speed": message.get("data", {}).get("speed", 1.0),
+                    "content": message["content"]
+                }
+
+                # 调用接口合成语音
+                voice_tmp_path = self.my_tts.fish_audio_api(data)
             
             elif message["tts_type"] == "gradio_tts":
                 data = {
@@ -1285,15 +1354,28 @@ class Audio:
                     # 是否启用字幕输出
                     # 每轮重读，与旁边的 web_captions_printer 一致；
                     # 在循环外取快照会让 webui 改了字幕开关并保存后必须重启 main 才生效
+                    # 点歌条目的 content 是歌曲文件的本机绝对路径（连同续播段），直接发字幕会把目录显示在直播画面上，
+                    # 所以 song 类型改发“♪ 歌名”（只取文件名），续播段不重复；歌词见 _run_lyric_display。
+                    # 点歌前那句“好的，正在为你播放…”是普通回复，照常显示
+                    if data_json.get("type") == "song":
+                        song_stem = data_json.get("lyric_stem") or self._song_title(voice_tmp_path)
+                        data_json["lyric_stem"] = song_stem
+                        caption_text = None
+                        if (self.config.get("choose_song") or {}).get("show_title", True) and not data_json.get("resumed"):
+                            caption_text = f"♪ {song_stem}"
+                    else:
+                        caption_text = data_json["content"]
+
                     captions_config = self.config.get("captions")
-                    if captions_config["enable"]:
+                    if captions_config["enable"] and caption_text:
                         # 输出当前播放的音频文件的文本内容到字幕文件中
-                        self.common.write_content_to_file(captions_config["file_path"], data_json["content"], write_log=False)
+                        self.common.write_content_to_file(captions_config["file_path"], caption_text, write_log=False)
 
 
                     # 判断是否发送web字幕打印机
-                    if self.config.get("web_captions_printer", "enable"):
-                        await self.common.send_to_web_captions_printer(self.config.get("web_captions_printer", "api_ip_port"), data_json)
+                    if self.config.get("web_captions_printer", "enable") and caption_text:
+                        await self.common.send_to_web_captions_printer(
+                            self.config.get("web_captions_printer", "api_ip_port"), {**data_json, "content": caption_text})
 
                     # 洛曦 直播弹幕助手
                     if self.config.get("luoxi_project", "Live_Comment_Assistant", "enable") and \
@@ -1385,9 +1467,67 @@ class Audio:
                                 # 使用pygame播放音频
                                 Audio.mixer_normal.music.load(voice_tmp_path)
                                 Audio.mixer_normal.music.play()
-                                while Audio.mixer_normal.music.get_busy():
-                                    pygame.time.Clock().tick(10)
+
+                                # 点歌歌词：后台按播放进度逐句发字幕，切歌/播完时停。不阻塞播放
+                                lyric_stop = None
+                                if (
+                                    data_json.get("type") == "song"
+                                    and (self.config.get("choose_song") or {}).get("show_lyrics", True)
+                                    and self.config.get("web_captions_printer", "enable")
+                                ):
+                                    lyric_stop = threading.Event()
+                                    threading.Thread(
+                                        target=self._run_lyric_display,
+                                        args=(data_json["lyric_stem"], voice_tmp_path, float(data_json.get("song_offset", 0.0)),
+                                              bool(data_json.get("resumed")), lyric_stop, time.monotonic()),
+                                        daemon=True, name="song-lyrics",
+                                    ).start()
+
+                                # 点歌限时：一首 5 分钟的歌会把后面所有弹幕都堵在队列里。
+                                # 规则：没人等就放完整首；队列里已经有待播内容，超过上限就淡出切走。
+                                limit_seconds = float(self.config.get("choose_song", "max_play_seconds") or 0)
+                                cut_only_when_waiting = self.config.get("choose_song", "cut_when_waiting")
+                                limit_this = data_json.get("type") == "song" and limit_seconds > 0
+                                started_ms = pygame.time.get_ticks()
+                                cut_at_seconds = None
+
+                                try:
+                                    while Audio.mixer_normal.music.get_busy():
+                                        pygame.time.Clock().tick(10)
+                                        if not limit_this:
+                                            continue
+                                        played_seconds = (pygame.time.get_ticks() - started_ms) / 1000.0
+                                        if played_seconds < limit_seconds:
+                                            continue
+                                        if cut_only_when_waiting and not (Audio.voice_tmp_path_queue or Audio.message_queue):
+                                            continue
+                                        logger.info(
+                                            f"点歌已播 {limit_seconds:g} 秒且队列有人在等，淡出切走：{voice_tmp_path}"
+                                        )
+                                        Audio.mixer_normal.music.fadeout(800)
+                                        # 听众实际听到的位置要再加上 800ms 淡出
+                                        cut_at_seconds = played_seconds + 0.8
+                                        limit_this = False
+                                        # 歌词跟着停，把字幕让给马上要说话的回复
+                                        if lyric_stop:
+                                            lyric_stop.set()
+                                finally:
+                                    if lyric_stop:
+                                        lyric_stop.set()
+
                                 Audio.mixer_normal.music.stop()
+
+                                # 被切走的点歌：等排队的回复播完，从断点接着放
+                                resume_scheduled = False
+                                song_cfg = self.config.get("choose_song") or {}
+                                if (
+                                    cut_at_seconds is not None
+                                    and song_cfg.get("resume_after_cut")
+                                    and int(data_json.get("resume_count", 0)) < int(song_cfg.get("resume_max_times") or 0)
+                                ):
+                                    resume_scheduled = self._schedule_song_resume(voice_tmp_path, cut_at_seconds, data_json)
+                                if data_json.get("temp_file") and not resume_scheduled:
+                                    self._remove_quietly(voice_tmp_path)
                                 
                                 await self.send_audio_play_info_to_callback()
                             except Exception as e:
@@ -1417,6 +1557,149 @@ class Audio:
         except Exception as e:
             logger.error(traceback.format_exc())
 
+
+    @staticmethod
+    def _song_title(path):
+        """歌名：只取文件名（不带目录和扩展名）。"""
+        return os.path.splitext(os.path.basename(str(path)))[0]
+
+    def _run_lyric_display(self, stem, path, offset, resumed, stop_event, t_start):
+        """按播放进度把歌词逐句发给字幕服务。
+
+        Args:
+            stem: 歌名（同时是歌词缓存的 key）
+            path: 当前段的音频文件（首段用来量时长做版本匹配）
+            offset: 当前段在原歌里的起始秒数（续播段非 0）
+            resumed: 是否续播段；续播段只复用首段已缓存的歌词
+            stop_event: 切歌/播完时被 set
+            t_start: 本段开始播放的 time.monotonic()
+
+        歌词只在内存里留到进程结束，不落盘，日志里也不打印歌词正文。
+        """
+        try:
+            lines = Audio.song_lyrics_cache.get(stem)
+            if lines is None:
+                if resumed:
+                    return
+                from utils.song_lyrics import match_lyrics
+                tolerance = float((self.config.get("choose_song") or {}).get("lyric_match_tolerance_seconds") or 3.0)
+                lines = match_lyrics(stem, AudioSegment.from_file(path).duration_seconds, tolerance)
+                # 只缓存匹配到的：没匹配到的下次点还会重试，换了文件/网络恢复后不用重启
+                if lines:
+                    Audio.song_lyrics_cache[stem] = lines
+            if not lines or stop_event.is_set():
+                return
+
+            api = self.config.get("web_captions_printer", "api_ip_port")
+
+            def position():
+                return offset + (time.monotonic() - t_start)
+
+            def show(text):
+                asyncio.run(self.common.send_to_web_captions_printer(api, {"content": text}))
+
+            # 匹配耗时、续播接缝都可能已经错过某句的开头：还在唱的那句补显示一下
+            now = position()
+            current = None
+            for i, (at, _text) in enumerate(lines):
+                if at <= now:
+                    current = i
+                else:
+                    break
+            next_index = 0 if current is None else current + 1
+            if current is not None and now - lines[current][0] < 4.0:
+                show(lines[current][1])
+
+            while next_index < len(lines) and not stop_event.is_set():
+                # 略提前，字幕是逐字出现的
+                wait = lines[next_index][0] - position() - 0.15
+                if wait > 0 and stop_event.wait(wait):
+                    break
+                if stop_event.is_set():
+                    break
+                show(lines[next_index][1])
+                next_index += 1
+        except Exception:
+            logger.error(traceback.format_exc())
+
+    @staticmethod
+    def _remove_quietly(path):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+    def _schedule_song_resume(self, source_path, cut_at_seconds, data_json):
+        """点歌被限时切走后，在后台切出剩余部分，重新排进队尾。
+
+        排在已经在等的回复之后、之后才到的弹幕之前（同优先级 FIFO）。
+        切 5 分钟的歌约 2~3 秒，回复播放期间就做完了。
+
+        Returns:
+            bool: 是否已交给后台线程。True 时 source_path（若是临时文件）由后台线程负责删除。
+        """
+        song_cfg = self.config.get("choose_song") or {}
+        rewind = float(song_cfg.get("resume_rewind_seconds") or 0)
+        resume_count = int(data_json.get("resume_count", 0)) + 1
+        is_temp = bool(data_json.get("temp_file"))
+        epoch = Audio.song_resume_epoch
+        resume_dir = os.path.join(self.config.get("play_audio", "out_path") or "out", "song_resume")
+        item_type = data_json.get("type")
+        content = data_json.get("content")
+        # 剩下不到这么久就不值得再续
+        min_remaining_ms = 8000
+
+        def worker():
+            new_path = None
+            try:
+                segment = AudioSegment.from_file(source_path)
+                start_ms = max(0, int((cut_at_seconds - rewind) * 1000))
+                remaining = segment[start_ms:]
+                if len(remaining) < min_remaining_ms:
+                    logger.info(f"点歌只剩 {len(remaining) / 1000:.1f} 秒，不再续播")
+                    return
+
+                os.makedirs(resume_dir, exist_ok=True)
+                # 取消点歌、打断时队列没清到的临时文件，按年龄兜底清理
+                for name in os.listdir(resume_dir):
+                    old = os.path.join(resume_dir, name)
+                    if time.time() - os.path.getmtime(old) > 3600:
+                        self._remove_quietly(old)
+
+                new_path = os.path.abspath(os.path.join(resume_dir, f"resume_{int(time.time() * 1000)}_{resume_count}.mp3"))
+                remaining.export(new_path, format="mp3", bitrate="128k")
+
+                if epoch != Audio.song_resume_epoch:
+                    logger.info("队列已被清空（取消点歌/打断），放弃续播")
+                    self._remove_quietly(new_path)
+                    return
+
+                logger.info(
+                    f"点歌续播第 {resume_count} 次：从 {start_ms / 1000:.1f} 秒起，剩 {len(remaining) / 1000:.1f} 秒 -> {new_path}"
+                )
+                self.data_priority_insert("待播放音频", {
+                    "type": item_type,
+                    "tts_type": "none",
+                    "voice_path": new_path,
+                    "content": content,
+                    "resumed": True,
+                    "resume_count": resume_count,
+                    "temp_file": True,
+                    # 歌词继续跟着原歌的时间轴：续播段的起点 = 上一段起点 + 本段切掉的秒数
+                    "lyric_stem": data_json.get("lyric_stem"),
+                    "song_offset": float(data_json.get("song_offset", 0.0)) + start_ms / 1000.0,
+                })
+                new_path = None
+            except Exception:
+                logger.error(traceback.format_exc())
+            finally:
+                if new_path:
+                    self._remove_quietly(new_path)
+                if is_temp:
+                    self._remove_quietly(source_path)
+
+        threading.Thread(target=worker, daemon=True, name="song-resume").start()
+        return True
 
     # 停止当前播放的音频
     def stop_current_audio(self):
@@ -1854,6 +2137,12 @@ class Audio:
             voice_tmp_path = self.my_tts.openai_tts_api(data)
             
         
+        elif audio_synthesis_type == "fish_audio":
+            # 试听与直播共用同一份音色配置；网络请求不阻塞 WebUI 事件循环。
+            data = dict(self.config.get("fish_audio") or {})
+            data["content"] = content
+            voice_tmp_path = await asyncio.to_thread(self.my_tts.fish_audio_api, data)
+
         elif audio_synthesis_type == "gradio_tts":
             data = {
                 "request_parameters": self.config.get("gradio_tts", "request_parameters"),

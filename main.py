@@ -20,15 +20,13 @@ from aip import AipSpeech
 import signal
 import time
 
-import http.server
-import socketserver
-
 from utils.my_log import logger
 from utils.common import Common
 from utils.config import Config
 from utils.my_handle import My_handle
 from utils.platforms import start_platform_listen
 import utils.my_global as my_global
+from utils.live2d_server import create_live2d_server
 
 r"""
 	___ _                       
@@ -49,8 +47,7 @@ config_path = "config.json"
 
 # web服务线程
 async def web_server_thread(web_server_port):
-    Handler = http.server.SimpleHTTPRequestHandler
-    with socketserver.TCPServer(("", web_server_port), Handler) as httpd:
+    with create_live2d_server(web_server_port) as httpd:
         logger.info(f"Web运行在端口：{web_server_port}")
         logger.info(
             f"可以直接访问Live2D页， http://127.0.0.1:{web_server_port}/Live2D/"
@@ -1023,7 +1020,8 @@ def start_server():
 
         while True:
             schedule.run_pending()
-            # time.sleep(1)  # 控制每次循环的间隔时间，避免过多占用 CPU 资源
+            # 控制每次循环的间隔，避免空转占满一个核（schedule 只支持秒级精度）
+            time.sleep(1)
 
     # 创建定时任务子线程并启动 在平台是 dy的情况下，默认启动定时任务用于阻塞
     schedule_thread = None

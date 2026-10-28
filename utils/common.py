@@ -1348,6 +1348,23 @@ class Common:
             return None
 
     # 请求web字幕打印机
+    def notify_stage(self, api_ip_port, path, params=None, timeout=(1, 1.5)):
+        """向舞台信号服务（字幕服务同进程）发一条状态变更。
+
+        失败只写 debug：思考气泡/特效不能因为服务没起来就影响直播主链路。
+
+        Args:
+            api_ip_port (str): 服务地址，例如 http://127.0.0.1:5500
+            path (str): /thinking 或 /effect
+            params (dict): 查询参数
+        """
+        try:
+            response = requests.get(url=api_ip_port + path, params=params or {}, timeout=timeout)
+            return response.status_code == 200
+        except Exception as error:
+            logger.debug(f'舞台信号 {path} 发送失败，已忽略：{error}')
+            return False
+
     async def send_to_web_captions_printer(self, api_ip_port, data):
         """请求web字幕打印机
 
@@ -1365,7 +1382,7 @@ class Common:
         # 记录数据库):
         try:
             # TODO: 换成异步请求
-            response = requests.get(url=api_ip_port + f'/send_message?content={content}', timeout=(10, 300))
+            response = requests.get(url=api_ip_port + '/send_message', params={'content': content}, timeout=(1, 2))
             response.raise_for_status()  # 检查响应的状态码
 
             result = response.content
