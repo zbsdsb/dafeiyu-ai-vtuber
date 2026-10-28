@@ -15,6 +15,7 @@ import time
 
 from utils.my_log import logger
 from utils.audio_handle.playback_stream import PlaybackStream
+from utils.audio_handle.ducking import clamp_ratio
 from utils.netease_music import download_netease_candidate, is_valid_audio_file, search_netease_songs
 
 # 没配置关键词时用这几组兜底；都偏「不抢人声」的器乐
@@ -34,13 +35,18 @@ class BGMPlayer:
 
     Args:
         config: utils.config.Config
-        is_voice_busy: 无参回调，返回 True 表示有语音正在播或被排队
+        is_voice_busy: 无参回调，返回 True 表示有人声正在播或被排队。
+            人声来了只把 BGM 音量压低（bgm.duck_ratio），不暂停；设成 0 则回到暂停。
+        is_song_busy: 无参回调，返回 True 表示点歌的歌正在放。
+            两首音乐不能叠着响，这时 BGM 完全让开（暂停）。
     """
 
-    def __init__(self, config, is_voice_busy):
+    def __init__(self, config, is_voice_busy, is_song_busy=None):
         self.config = config
         self.is_voice_busy = is_voice_busy
-
+        self.is_song_busy = is_song_busy
+        self._level = 1.0             # 相对 bgm.volume 的比例：压低时是 duck_ratio，正常是 1.0
+        self._last_speech_at = -1e9   # 最近一次检测到人声的时刻
         self.stream = PlaybackStream(BGM_CHANNEL_INDEX)
 
         self._running = False
@@ -94,6 +100,8 @@ class BGMPlayer:
             "min_track_seconds": float(bgm.get("min_track_seconds") or 45),
             "max_track_seconds": float(bgm.get("max_track_seconds") or 600),
             "resume_delay_seconds": float(bgm.get("resume_delay_seconds") or 1.0),
+            # 0 是有意义的（人声来了直接暂停），所以不能写成 `or` 默认值
+            "duck_ratio": clamp_ratio(bgm.get("duck_ratio"), 0.35),
             "candidate_tries": int(bgm.get("candidate_tries") or 4),
         }
 
@@ -107,17 +115,35 @@ class BGMPlayer:
                 self._stop_current()
             return
 
-        if self.is_voice_busy():
-            self._last_busy_at = time.monotonic()
+        now = time.monotonic()
+        song = bool(self.is_song_busy and self.is_song_busy())
+        speech = bool(self.is_voice_busy())
+        if speech:
+            self._last_speech_at = now
+
+        # 点歌的歌在放，或者配置成“人声来了直接暂停”：完全让开
+        if song or (speech and cfg["duck_ratio"] <= 0):
+            self._last_busy_at = now
             if not self._paused:
                 self._duck(cfg)
             return
 
         if self._paused:
-            if time.monotonic() - self._last_busy_at < cfg["resume_delay_seconds"]:
+            if now - self._last_busy_at < cfg["resume_delay_seconds"]:
                 return
-            self._unduck(cfg)
+            # 从暂停恢复时她可能正好在说话，那就直接从压低的音量继续
+            self._unduck(cfg, cfg["duck_ratio"] if speech else 1.0)
             return
+
+        # 人声来了只压低音量；说完后留 resume_delay 再抬回来，避免句与句之间音量一跳一跳
+        low = speech or (now - self._last_speech_at < cfg["resume_delay_seconds"])
+        target = cfg["duck_ratio"] if low else 1.0
+        if self.stream.get_busy() and abs(self._level - target) > 0.01:
+            logger.info(f"[BGM] {'压低音量（她在说话）：%d%%' % int(target * 100) if low else '恢复音量'}")
+            if low:
+                self._ramp_to(cfg, target, 4, 0.04)
+            else:
+                self._ramp_to(cfg, target, 8, 0.1)
 
         if not self.stream.get_busy():
             if self._current is not None:
@@ -141,20 +167,34 @@ class BGMPlayer:
         except Exception as e:
             logger.error(f"[BGM] 暂停失败: {e}")
 
-    def _unduck(self, cfg):
+    def _unduck(self, cfg, level=1.0):
         self._paused = False
+        self._level = level
         logger.info(f"[BGM] 恢复：{self._current or '无曲目'}")
         try:
             self.stream.set_volume(0.0)
             self.stream.unpause()
             steps = 5
             for i in range(1, steps + 1):
-                self.stream.set_volume(cfg["volume"] * i / steps)
+                self.stream.set_volume(cfg["volume"] * level * i / steps)
                 time.sleep(0.08)
         except Exception as e:
             logger.error(f"[BGM] 恢复失败: {e}")
 
+    def _ramp_to(self, cfg, level, steps, delay):
+        """把音量比例平滑调到 level（不暂停）。"""
+        start = self._level
+        try:
+            for i in range(1, steps + 1):
+                self._level = start + (level - start) * i / steps
+                self.stream.set_volume(cfg["volume"] * self._level)
+                time.sleep(delay)
+            self._level = level
+        except Exception as e:
+            logger.error(f"[BGM] 调音量失败: {e}")
+
     def _stop_current(self):
+        self._level = 1.0
         self._paused = False
         self._current = None
         self._current_path = None
@@ -184,7 +224,8 @@ class BGMPlayer:
 
         path, display_name = item
         try:
-            self.stream.set_volume(cfg["volume"])
+            # 新的一首从当前的压低状态开始，不要在她说话时猛地突然响起来
+            self.stream.set_volume(cfg["volume"] * self._level)
             self.stream.load(path)
             self.stream.play()
             self._current = display_name

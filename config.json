@@ -87,6 +87,7 @@
     "min_track_seconds": 45,
     "max_track_seconds": 600,
     "resume_delay_seconds": 1.0,
+    "duck_ratio": 0.35,
     "candidate_tries": 4
   },
   "play_audio": {
@@ -722,6 +723,9 @@
     "show_title": true,
     "show_lyrics": true,
     "lyric_match_tolerance_seconds": 3.0,
+    "overlap_speech": true,
+    "duck_ratio": 0.3,
+    "duck_release_seconds": 1.2,
     "match_fail_copy": "抱歉，我还没学会唱{content}"
   },
   "sd": {

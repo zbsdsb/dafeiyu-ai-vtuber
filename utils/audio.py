@@ -19,6 +19,7 @@ from utils.audio_handle.my_tts import MY_TTS
 from utils.audio_handle.audio_player import AUDIO_PLAYER
 from utils.audio_handle.playback_stream import PlaybackStream
 from utils.audio_handle.bgm_player import BGMPlayer
+from utils.audio_handle.ducking import clamp_ratio, duck_step
 import utils.my_global as my_global
 
 
@@ -62,6 +63,36 @@ class Audio:
     # 点歌歌词（内存缓存，不落盘）：歌名 -> [(秒, 文字)]，只缓存匹配成功的
     song_lyrics_cache = {}
 
+    # 点歌与说话同时播（2026-10-28）：歌走独立 channel 3，她说话时只把歌的音量压低。
+    # 以前歌和回复在同一条队列里轮流播，说话就得等歌被切掉，在观众听来就是歌被打断。
+    mixer_song = None
+    song_queue = []                 # 等着播的点歌，先到先播
+    song_queue_lock = threading.Lock()
+    song_queue_cond = threading.Condition(song_queue_lock)
+    song_playing = False            # 点歌 channel 正在放歌
+    normal_playing_song = False     # 旧路径（关掉同时播）：mixer_normal 正在放歌
+    song_stop_epoch = 0             # 取消点歌/打断时 +1，正在放的歌看到变了就淡出结束
+    last_speech_at = -1e9           # 最近一次检测到人声的时刻（给歌词字幕让路用）
+
+    @staticmethod
+    def speech_active():
+        """现在有没有人声在响或已经排上队（点歌的歌不算人声）。
+
+        不看待合成队列：等 Fish 合成要 2~4 秒，那段时间音乐该继续响着。
+        """
+        try:
+            if (Audio.mixer_normal is not None and Audio.mixer_normal.get_busy()
+                    and not Audio.normal_playing_song):
+                return True
+        except Exception:
+            pass
+        return any(item.get("type") != "song" for item in list(Audio.voice_tmp_path_queue))
+
+    @staticmethod
+    def song_active():
+        """现在是不是有点歌的歌在放（BGM 要完全让开，不能两首音乐叠着响）。"""
+        return bool(Audio.song_playing or Audio.normal_playing_song)
+
     # 异常报警数据
     abnormal_alarm_data = alarm.new_state()
 
@@ -85,16 +116,19 @@ class Audio:
             # 弹幕回复一起暂停。
             Audio.mixer_normal = PlaybackStream(0)
             Audio.mixer_copywriting = PlaybackStream(1)
+            # channel 2 给 BGM，channel 3 给点歌：歌和人声不共用通道，才能同时响
+            Audio.mixer_song = PlaybackStream(3)
+            threading.Thread(target=self._song_loop, daemon=True, name="song-player").start()
 
-            # 空闲 BGM：说话/点歌在播时自动暂停，播完再续上。
-            # 只看「已经有音频在响或已排上队」，不看待合成队列：等 Fish 合成要 2~4 秒，
+            # 空闲 BGM：人声来了只把音量压低，点歌的歌在放时完全让开（暂停）。
+            # 人声只看「已经有音频在响或已排上队」，不看待合成队列：等 Fish 合成要 2~4 秒，
             # 那段时间该让 BGM 继续响着，不然就成了另一次冷场。
             # 也要看队列而不只是 get_busy()：一段回复被拆成多句，句与句之间有几十
             # 毫秒空档，只靠 get_busy() 会让 BGM 在句子中间抽插。
             Audio.bgm = BGMPlayer(
                 self.config,
-                lambda: Audio.mixer_normal.get_busy()
-                or bool(Audio.voice_tmp_path_queue),
+                Audio.speech_active,
+                Audio.song_active,
             )
             Audio.bgm.start()
 
@@ -130,10 +164,17 @@ class Audio:
         try:
             Audio.song_resume_epoch += 1
             if type == "voice_tmp_path_queue":
+                # 等着播的点歌也属于“待播队列”，清队列时一起清
+                with Audio.song_queue_lock:
+                    dropped = list(Audio.song_queue)
+                    Audio.song_queue.clear()
                 if len(Audio.voice_tmp_path_queue) == 0:
+                    self._drop_temp_files(dropped)
                     return True
                 with self.voice_tmp_path_queue_lock:
+                    dropped += list(Audio.voice_tmp_path_queue)
                     Audio.voice_tmp_path_queue.clear()
+                self._drop_temp_files(dropped)
                 return True
             elif type == "message_queue":
                 if len(Audio.message_queue) == 0:
@@ -152,6 +193,7 @@ class Audio:
             if type == "pygame":
                 if mixer_normal:
                     Audio.mixer_normal.music.stop()
+                    self._stop_song(0)
                     logger.info("停止普通音频播放")
                 if mixer_copywriting:
                     Audio.mixer_copywriting.music.stop()
@@ -202,6 +244,10 @@ class Audio:
           所以只能退化成看队列（外加外接项目报回来的 wait_play_audio_num）。
         """
         if len(Audio.message_queue) or len(Audio.voice_tmp_path_queue):
+            return True
+
+        # 点歌的歌在独立通道里放，不在 mixer_normal 上
+        if Audio.song_playing or len(Audio.song_queue):
             return True
 
         if self.config.get("play_audio", "player") in ["pygame"]:
@@ -1341,6 +1387,11 @@ class Audio:
 
                     voice_tmp_path = data_json["voice_path"]
 
+                    # 点歌走独立通道在后台放，不阻塞这条队列：后面的回复照常播，歌只是被压低音量
+                    if self._song_overlap_wanted(data_json):
+                        self._enqueue_song(data_json)
+                        continue
+
                     # 如果文案标志位为2，则说明在播放中，需要暂停
                     if Audio.copywriting_play_flag == 2:
                         logger.debug("暂停文案播放，等待一个切换间隔")
@@ -1464,6 +1515,8 @@ class Audio:
                             import pygame
 
                             try:
+                                # 旧路径（同时播关闭时）歌也在 mixer_normal 上放，要告诉 BGM 这不是人声
+                                Audio.normal_playing_song = data_json.get("type") == "song"
                                 # 使用pygame播放音频
                                 Audio.mixer_normal.music.load(voice_tmp_path)
                                 Audio.mixer_normal.music.play()
@@ -1546,6 +1599,7 @@ class Audio:
                 except Exception as e:
                     logger.error(traceback.format_exc())
                 finally:
+                    Audio.normal_playing_song = False
                     # 恢复文案这一步必须放在 finally。两条流各占一个 channel 之后，
                     # 文案被暂停时 get_busy() 仍为真，文案线程会一直在 while 里等，
                     # 录音闸门也跟着一直关着；以前共用一条 music 流时"暂停"会被当成
@@ -1557,6 +1611,172 @@ class Audio:
         except Exception as e:
             logger.error(traceback.format_exc())
 
+
+    # ---------- 点歌独立通道：说话时压低音量，不再排队等歌放完 ----------
+
+    def _song_overlap_wanted(self, data_json):
+        """这条点歌是否走独立通道。任何条件不满足都走原来的排队播放。"""
+        if data_json.get("type") != "song" or Audio.mixer_song is None:
+            return False
+        if not (self.config.get("choose_song") or {}).get("overlap_speech"):
+            return False
+        if self.config.get("play_audio", "player") not in ["pygame"]:
+            return False
+        return self.config.get("visual_body") not in [
+            "xuniren", "EasyAIVtuber", "digital_human_video_player", "live2d_TTS_LLM_GPT_SoVITS_Vtuber"]
+
+    def _enqueue_song(self, data_json):
+        with Audio.song_queue_lock:
+            Audio.song_queue.append(data_json)
+            Audio.song_queue_cond.notify()
+
+    def _stop_song(self, fade_ms):
+        """取消点歌/打断：清掉等着的歌，正在放的那首淡出结束且不再续播。"""
+        Audio.song_stop_epoch += 1
+        with Audio.song_queue_lock:
+            dropped = list(Audio.song_queue)
+            Audio.song_queue.clear()
+        self._drop_temp_files(dropped)
+        if Audio.mixer_song is not None:
+            if fade_ms:
+                Audio.mixer_song.fadeout(fade_ms)
+            else:
+                Audio.mixer_song.stop()
+
+    def _drop_temp_files(self, items):
+        """被清掉的队列项里如果有续播段的临时文件，一起删掉。"""
+        for item in items:
+            if item.get("temp_file") and item.get("voice_path"):
+                self._remove_quietly(item["voice_path"])
+
+    @staticmethod
+    def _song_waiting():
+        """还有没有别的歌在等（同时播开启后，弹幕回复不再需要等歌，只有歌要等歌）。"""
+        with Audio.song_queue_lock:
+            if Audio.song_queue:
+                return True
+        return any(item.get("type") == "song" for item in list(Audio.voice_tmp_path_queue))
+
+    def _song_loop(self):
+        while True:
+            try:
+                with Audio.song_queue_lock:
+                    while not Audio.song_queue:
+                        Audio.song_queue_cond.wait()
+                    item = Audio.song_queue.pop(0)
+                self._play_song(item)
+            except Exception:
+                logger.error(traceback.format_exc())
+                Audio.song_playing = False
+
+    def _play_song(self, data_json):
+        """在点歌通道里放一首歌，直到放完 / 被取消 / 被限时切走。
+
+        放的过程中：她在说话就把音量压到 duck_ratio，说完再慢慢抬回来；
+        歌词字幕跟着进度走，她说话时把字幕让给她。
+        """
+        path = data_json["voice_path"]
+        cfg = self.config.get("choose_song") or {}
+        stream = Audio.mixer_song
+        stem = data_json.get("lyric_stem") or self._song_title(path)
+        data_json["lyric_stem"] = stem
+        resumed = bool(data_json.get("resumed"))
+        epoch = Audio.song_stop_epoch
+
+        duck_ratio = clamp_ratio(cfg.get("duck_ratio"), 0.3)
+        release_seconds = float(cfg.get("duck_release_seconds") or 1.2)
+        limit_seconds = float(cfg.get("max_play_seconds") or 0)
+        cut_only_when_waiting = cfg.get("cut_when_waiting")
+
+        lyric_stop = threading.Event()
+        cut_at_seconds = None
+        stopped = False
+        Audio.song_playing = True   # 先置位：加载整首歌要几百毫秒，BGM 不该在这段时间里继续响
+        try:
+            # 标题字幕（不带目录）
+            if cfg.get("show_title", True) and not resumed:
+                self._send_song_caption(f"♪ {stem}")
+
+            stream.load(path)
+            stream.play()
+            stream.set_volume(1.0)
+            started = time.monotonic()
+
+            if cfg.get("show_lyrics", True) and self.config.get("web_captions_printer", "enable"):
+                threading.Thread(
+                    target=self._run_lyric_display,
+                    args=(stem, path, float(data_json.get("song_offset", 0.0)), resumed, lyric_stop, started),
+                    daemon=True, name="song-lyrics",
+                ).start()
+
+            level = 1.0
+            ducked = False
+            while stream.get_busy():
+                time.sleep(0.1)
+                now = time.monotonic()
+
+                if epoch != Audio.song_stop_epoch:
+                    # 取消点歌：淡出已经由 _stop_song 触发，这里只等它结束
+                    stopped = True
+                    lyric_stop.set()
+                    continue
+
+                speech = Audio.speech_active()
+                if speech:
+                    Audio.last_speech_at = now
+                want_duck = speech or (now - Audio.last_speech_at < release_seconds)
+                if want_duck != ducked:
+                    ducked = want_duck
+                    logger.info(f"[点歌] {'她在说话，音乐压到 %d%%' % int(duck_ratio * 100) if ducked else '说完了，音乐恢复'}")
+                new_level = duck_step(level, duck_ratio if ducked else 1.0)
+                if new_level != level:
+                    level = new_level
+                    stream.set_volume(level)
+
+                # 限时：同时播开启后弹幕回复不用等歌，只有“另一首歌在等”才算堵住
+                if cut_at_seconds is None and limit_seconds > 0:
+                    played = now - started
+                    if played >= limit_seconds and (not cut_only_when_waiting or self._song_waiting()):
+                        logger.info(f"点歌已播 {limit_seconds:g} 秒且有另一首在等，淡出切走：{path}")
+                        stream.fadeout(800)
+                        cut_at_seconds = played + 0.8
+                        lyric_stop.set()
+        finally:
+            lyric_stop.set()
+            try:
+                stream.stop()
+            except Exception:
+                pass
+            Audio.song_playing = False
+
+        resume_scheduled = False
+        if (
+            cut_at_seconds is not None and not stopped
+            and cfg.get("resume_after_cut")
+            and int(data_json.get("resume_count", 0)) < int(cfg.get("resume_max_times") or 0)
+        ):
+            resume_scheduled = self._schedule_song_resume(path, cut_at_seconds, data_json)
+        if data_json.get("temp_file") and not resume_scheduled:
+            self._remove_quietly(path)
+
+        try:
+            asyncio.run(self.send_audio_play_info_to_callback())
+        except Exception:
+            logger.error(traceback.format_exc())
+
+    def _send_song_caption(self, text):
+        """把一句字幕发给字幕服务（以及文件字幕），她正在说话时不发。"""
+        if Audio.speech_active():
+            return
+        try:
+            captions_config = self.config.get("captions")
+            if captions_config and captions_config["enable"]:
+                self.common.write_content_to_file(captions_config["file_path"], text, write_log=False)
+            if self.config.get("web_captions_printer", "enable"):
+                asyncio.run(self.common.send_to_web_captions_printer(
+                    self.config.get("web_captions_printer", "api_ip_port"), {"content": text}))
+        except Exception:
+            logger.error(traceback.format_exc())
 
     @staticmethod
     def _song_title(path):
@@ -1596,6 +1816,9 @@ class Audio:
                 return offset + (time.monotonic() - t_start)
 
             def show(text):
+                # 她在说话（或刚说完）时字幕归她，歌词跳过这一句，不把她的字幕挤掉
+                if Audio.speech_active() or time.monotonic() - Audio.last_speech_at < 1.0:
+                    return
                 asyncio.run(self.common.send_to_web_captions_printer(api, {"content": text}))
 
             # 匹配耗时、续播接缝都可能已经错过某句的开头：还在唱的那句补显示一下
@@ -1707,6 +1930,8 @@ class Audio:
             Audio.audio_player.skip_current_stream()
         else:
             Audio.mixer_normal.music.fadeout(1000)
+            # 同时播的点歌也要一起停，并清掉等着的歌
+            self._stop_song(1000)
 
     r"""
                                                      ./@\]                    
